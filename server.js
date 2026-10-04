@@ -39,14 +39,13 @@ function cacheGet(k) {
 }
 function cacheSet(k, v) { cache.set(k, { ts: Date.now(), value: v }); }
 
-// периодическая чистка
 setInterval(() => {
   const now = Date.now();
   for (const [k, e] of cache) if (now - e.ts > CACHE_TTL_MS) cache.delete(k);
 }, CACHE_TTL_MS).unref();
 
-// ---------- rate limit (in-memory, по IP) ----------
-const hits = new Map(); // ip -> { count, reset }
+// ---------- rate limit ----------
+const hits = new Map();
 function rateLimit(req, res, next) {
   const ip = req.ip || req.socket.remoteAddress || "?";
   const now = Date.now();
@@ -79,11 +78,65 @@ async function fetchJson(url) {
 
 const isSteamId64 = (s) => /^\d{17}$/.test(s);
 
+// Универсальный парсер ввода: SteamID64 | vanity | URL профиля
+// Возвращает { type: "id" | "vanity", value: string }
+function parseInput(raw) {
+  let s = String(raw ?? "").trim();
+  if (!s) return null;
+
+  // убираем пробелы и обрамляющие кавычки/уголки на всякий
+  s = s.replace(/^[<"']+|[>"']+$/g, "").trim();
+
+  // чистый SteamID64
+  if (isSteamId64(s)) return { type: "id", value: s };
+
+  // попытка распарсить как URL (даже без схемы)
+  try {
+    const withProto = /^https?:\/\//i.test(s) ? s : `https://${s}`;
+    const u = new URL(withProto);
+
+    // только steamcommunity.com и его поддомены
+    if (/(^|\.)steamcommunity\.com$/i.test(u.hostname)) {
+      const parts = u.pathname.split("/").filter(Boolean);
+
+      // /profiles/<steamid64>
+      if (parts[0] === "profiles" && parts[1] && isSteamId64(parts[1])) {
+        return { type: "id", value: parts[1] };
+      }
+
+      // /id/<vanity>
+      if (parts[0] === "id" && parts[1]) {
+        return { type: "vanity", value: decodeURIComponent(parts[1]) };
+      }
+
+      // иногда ссылка вида /profiles/<vanity> — на всякий, трактуем как vanity
+      if (parts[0] === "profiles" && parts[1]) {
+        return { type: "vanity", value: decodeURIComponent(parts[1]) };
+      }
+
+      // просто steamcommunity.com/<что-то> — редкость, но попробуем
+      if (parts[0]) {
+        return { type: "vanity", value: decodeURIComponent(parts[0]) };
+      }
+    }
+
+    // URL, но не Steam — возможно, просто вставили "https://gaben"
+    // тогда берём последний сегмент пути как vanity
+    const seg = u.pathname.split("/").filter(Boolean).pop();
+    if (seg) return { type: "vanity", value: decodeURIComponent(seg) };
+  } catch {
+    // не URL — значит просто ник
+  }
+
+  // fallback — vanity
+  return { type: "vanity", value: s };
+}
+
 async function resolveVanity(vanity) {
   const d = await fetchJson(
     `${STEAM}/ISteamUser/ResolveVanityURL/v1/?key=${KEY}&vanityurl=${encodeURIComponent(vanity)}`
   );
-  if (d.response?.success !== 1) throw new Error("vanity не найден");
+  if (d.response?.success !== 1) throw new Error("профиль не найден (vanity)");
   return d.response.steamid;
 }
 
@@ -121,12 +174,10 @@ const getFriends = (id) => safe(async () => {
 });
 
 // ---------- trust heuristic ----------
-// НЕ официальный Trust Factor Valve. Скоринг на публичных сигналах.
 function trustHeuristic({ summary, bans, games, level, friends }) {
   let score = 50;
   const notes = [];
 
-  // баны
   const cleanBans = !bans.VACBanned && !bans.CommunityBanned && !bans.NumberOfGameBans;
   if (bans.VACBanned) { score -= 40; notes.push(`VAC ban (${bans.NumberOfVACBans || 1})`); }
   if (bans.NumberOfGameBans > 0) { score -= 25; notes.push(`game ban: ${bans.NumberOfGameBans}`); }
@@ -134,7 +185,6 @@ function trustHeuristic({ summary, bans, games, level, friends }) {
   if (bans.EconomyBan && bans.EconomyBan !== "none") { score -= 30; notes.push(`economy ban: ${bans.EconomyBan}`); }
   if (cleanBans) { score += 10; notes.push("банов нет"); }
 
-  // возраст
   const ageYears = summary.timecreated
     ? (Date.now() / 1000 - summary.timecreated) / (365.25 * 86400)
     : 0;
@@ -143,7 +193,6 @@ function trustHeuristic({ summary, bans, games, level, friends }) {
   else if (ageYears >= 2) { score += 5; notes.push(`аккаунту ${ageYears.toFixed(1)} лет`); }
   else if (ageYears > 0 && ageYears < 0.5) { score -= 10; notes.push("аккаунт свежий (< 6 мес)"); }
 
-  // cs2
   const cs = games.find(g => g.appid === 730);
   if (cs) {
     const h = Math.round(cs.playtime_forever / 60);
@@ -155,7 +204,6 @@ function trustHeuristic({ summary, bans, games, level, friends }) {
     notes.push("CS2 не в библиотеке");
   }
 
-  // level
   if (level != null) {
     if (level >= 50) score += 8;
     else if (level >= 20) score += 4;
@@ -163,7 +211,6 @@ function trustHeuristic({ summary, bans, games, level, friends }) {
     notes.push(`Steam level: ${level}`);
   }
 
-  // друзья
   if (friends != null) {
     if (friends >= 100) { score += 5; notes.push(`друзей: ${friends}`); }
     else if (friends < 5) { score -= 5; notes.push(`друзей: ${friends} — мало`); }
@@ -172,7 +219,6 @@ function trustHeuristic({ summary, bans, games, level, friends }) {
     notes.push("список друзей скрыт");
   }
 
-  // приватность
   if (summary.communityvisibilitystate === 3) { score += 5; notes.push("профиль публичный"); }
   else { score -= 5; notes.push("профиль частично закрыт"); }
 
@@ -186,14 +232,13 @@ const app = express();
 app.set("trust proxy", true);
 app.disable("x-powered-by");
 
-// базовые security-заголовки
 app.use((req, res, next) => {
   res.set({
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
     "Content-Security-Policy":
-      "default-src 'self'; img-src 'self' https://avatars.steamstatic.com https://avatars.cloudflare.steamstatic.com data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'",
+      "default-src 'self'; img-src 'self' https://avatars.steamstatic.com https://avatars.cloudflare.steamstatic.com https://community.cloudflare.steamstatic.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'",
   });
   next();
 });
@@ -205,19 +250,27 @@ app.get("/healthz", (req, res) => res.json({ ok: true }));
 app.get("/api/profile", rateLimit, async (req, res) => {
   const started = Date.now();
   try {
-    let id = String(req.query.id || "").trim();
-    if (!id) return res.status(400).json({ error: "параметр id обязателен" });
-    if (id.length > 64) return res.status(400).json({ error: "слишком длинный id" });
+    const raw = String(req.query.id || "").trim();
+    if (!raw) return res.status(400).json({ error: "введи ник, SteamID64 или ссылку" });
+    if (raw.length > 256) return res.status(400).json({ error: "слишком длинный ввод" });
+
+    const parsed = parseInput(raw);
+    if (!parsed) return res.status(400).json({ error: "не удалось распознать ввод" });
 
     const refresh = req.query.refresh === "1";
-    const cacheKey = `p:${id.toLowerCase()}`;
+    const cacheKey = `p:${parsed.type}:${parsed.value.toLowerCase()}`;
 
     if (!refresh) {
       const cached = cacheGet(cacheKey);
       if (cached) return res.json({ ...cached, _cached: true });
     }
 
-    if (!isSteamId64(id)) id = await resolveVanity(id);
+    let id;
+    if (parsed.type === "id") {
+      id = parsed.value;
+    } else {
+      id = await resolveVanity(parsed.value);
+    }
 
     const [summary, bans, games, level, friends] = await Promise.all([
       getSummary(id),
@@ -256,9 +309,13 @@ app.get("/api/profile", rateLimit, async (req, res) => {
         } : null,
       },
       trust,
+      _input: { raw, resolved: { type: parsed.type, value: parsed.value } },
     };
 
+    // кладём в кэш и под уже разрешённым id, чтобы повторные запросы по id тоже попадали
     cacheSet(cacheKey, payload);
+    cacheSet(`p:id:${id.toLowerCase()}`, payload);
+
     res.json({ ...payload, _cached: false });
   } catch (e) {
     const msg = e.name === "AbortError" ? "Steam API не ответил вовремя" : e.message;
