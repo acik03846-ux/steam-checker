@@ -27,10 +27,11 @@ const PORT = Number(process.env.PORT) || 8080;
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS) || 5 * 60 * 1000;
 const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX) || 30;
 const STEAM = "https://api.steampowered.com";
-const FETCH_TIMEOUT_MS = 8000;
+const FETCH_TIMEOUT_MS = 10000;
+const CS2_APPID = 730;
 
 // ---------- cache ----------
-const cache = new Map(); // key -> { ts, value }
+const cache = new Map();
 function cacheGet(k) {
   const e = cache.get(k);
   if (!e) return null;
@@ -63,7 +64,7 @@ setInterval(() => {
   for (const [ip, h] of hits) if (now > h.reset) hits.delete(ip);
 }, 60_000).unref();
 
-// ---------- steam api ----------
+// ---------- steam api helpers ----------
 async function fetchJson(url) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
@@ -76,66 +77,47 @@ async function fetchJson(url) {
   }
 }
 
+async function fetchText(url) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal });
+    if (!r.ok) throw new Error(`steam ${r.status}`);
+    return await r.text();
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 const isSteamId64 = (s) => /^\d{17}$/.test(s);
 
-// Универсальный парсер ввода: SteamID64 | vanity | URL профиля
-// Возвращает { type: "id" | "vanity", value: string }
 function parseInput(raw) {
   let s = String(raw ?? "").trim();
   if (!s) return null;
-
-  // убираем пробелы и обрамляющие кавычки/уголки на всякий
   s = s.replace(/^[<"']+|[>"']+$/g, "").trim();
-
-  // чистый SteamID64
   if (isSteamId64(s)) return { type: "id", value: s };
 
-  // попытка распарсить как URL (даже без схемы)
   try {
     const withProto = /^https?:\/\//i.test(s) ? s : `https://${s}`;
     const u = new URL(withProto);
-
-    // только steamcommunity.com и его поддомены
     if (/(^|\.)steamcommunity\.com$/i.test(u.hostname)) {
       const parts = u.pathname.split("/").filter(Boolean);
-
-      // /profiles/<steamid64>
-      if (parts[0] === "profiles" && parts[1] && isSteamId64(parts[1])) {
-        return { type: "id", value: parts[1] };
-      }
-
-      // /id/<vanity>
-      if (parts[0] === "id" && parts[1]) {
-        return { type: "vanity", value: decodeURIComponent(parts[1]) };
-      }
-
-      // иногда ссылка вида /profiles/<vanity> — на всякий, трактуем как vanity
-      if (parts[0] === "profiles" && parts[1]) {
-        return { type: "vanity", value: decodeURIComponent(parts[1]) };
-      }
-
-      // просто steamcommunity.com/<что-то> — редкость, но попробуем
-      if (parts[0]) {
-        return { type: "vanity", value: decodeURIComponent(parts[0]) };
-      }
+      if (parts[0] === "profiles" && parts[1] && isSteamId64(parts[1])) return { type: "id", value: parts[1] };
+      if (parts[0] === "id" && parts[1]) return { type: "vanity", value: decodeURIComponent(parts[1]) };
+      if (parts[0] === "profiles" && parts[1]) return { type: "vanity", value: decodeURIComponent(parts[1]) };
+      if (parts[0]) return { type: "vanity", value: decodeURIComponent(parts[0]) };
     }
-
-    // URL, но не Steam — возможно, просто вставили "https://gaben"
-    // тогда берём последний сегмент пути как vanity
     const seg = u.pathname.split("/").filter(Boolean).pop();
     if (seg) return { type: "vanity", value: decodeURIComponent(seg) };
-  } catch {
-    // не URL — значит просто ник
-  }
+  } catch { /* not URL */ }
 
-  // fallback — vanity
   return { type: "vanity", value: s };
 }
 
+// ---------- Steam Web API calls ----------
+
 async function resolveVanity(vanity) {
-  const d = await fetchJson(
-    `${STEAM}/ISteamUser/ResolveVanityURL/v1/?key=${KEY}&vanityurl=${encodeURIComponent(vanity)}`
-  );
+  const d = await fetchJson(`${STEAM}/ISteamUser/ResolveVanityURL/v1/?key=${KEY}&vanityurl=${encodeURIComponent(vanity)}`);
   if (d.response?.success !== 1) throw new Error("профиль не найден (vanity)");
   return d.response.steamid;
 }
@@ -152,29 +134,81 @@ async function getBans(id) {
   return d.players?.[0] || {};
 }
 
-async function safe(fn, fallback = null) {
-  try { return await fn(); } catch { return fallback; }
+async function getOwnedGames(id) {
+  try {
+    const d = await fetchJson(`${STEAM}/IPlayerService/GetOwnedGames/v1/?key=${KEY}&steamid=${id}&include_appinfo=1&include_played_free_games=1`);
+    return d.response?.games || [];
+  } catch { return []; }
 }
 
-const getOwnedGames = (id) => safe(async () => {
-  const d = await fetchJson(
-    `${STEAM}/IPlayerService/GetOwnedGames/v1/?key=${KEY}&steamid=${id}&include_appinfo=1&include_played_free_games=1`
-  );
-  return d.response?.games || [];
-}, []);
+async function getSteamLevel(id) {
+  try {
+    const d = await fetchJson(`${STEAM}/IPlayerService/GetSteamLevel/v1/?key=${KEY}&steamid=${id}`);
+    return d.response?.player_level ?? null;
+  } catch { return null; }
+}
 
-const getSteamLevel = (id) => safe(async () => {
-  const d = await fetchJson(`${STEAM}/IPlayerService/GetSteamLevel/v1/?key=${KEY}&steamid=${id}`);
-  return d.response?.player_level ?? null;
-});
+async function getFriends(id) {
+  try {
+    const d = await fetchJson(`${STEAM}/ISteamUser/GetFriendList/v1/?key=${KEY}&steamid=${id}`);
+    return d.friendslist?.friends || null;
+  } catch { return null; }
+}
 
-const getFriends = (id) => safe(async () => {
-  const d = await fetchJson(`${STEAM}/ISteamUser/GetFriendList/v1/?key=${KEY}&steamid=${id}`);
-  return d.friendslist?.friends?.length ?? null;
-});
+// ДОБАВЛЕНО: Статистика CS2 (убийства, wins, точность и т.д.)
+async function getGameStats(id, appid = CS2_APPID) {
+  try {
+    const d = await fetchJson(`${STEAM}/ISteamUserStats/GetUserStatsForGame/v2/?key=${KEY}&steamid=${id}&appid=${appid}`);
+    return d.playerstats?.stats || null;
+  } catch { return null; }
+}
+
+// ДОБАВЛЕНО: Достижения CS2
+async function getAchievements(id, appid = CS2_APPID) {
+  try {
+    const d = await fetchJson(`${STEAM}/ISteamUserStats/GetPlayerAchievements/v1/?key=${KEY}&steamid=${id}&appid=${appid}&l=russian`);
+    return d.playerstats?.achievements || null;
+  } catch { return null; }
+}
+
+// ДОБАВЛЕНО: Недавние игры за 2 недели
+async function getRecentGames(id) {
+  try {
+    const d = await fetchJson(`${STEAM}/IPlayerService/GetRecentlyPlayedGames/v1/?key=${KEY}&steamid=${id}&count=10`);
+    return d.response?.games || [];
+  } catch { return []; }
+}
+
+// ДОБАВЛЕНО: XML-профиль (headline, summary, tradeban state)
+async function getXmlProfile(id) {
+  try {
+    const text = await fetchText(`https://steamcommunity.com/profiles/${id}/?xml=1`);
+    const pick = (tag) => {
+      const m = text.match(new RegExp(`<${tag}>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?<\\/${tag}>`));
+      return m ? m[1].trim() : null;
+    };
+    return {
+      headline: pick("headline"),
+      summary: pick("summary"),
+      hours_played_2wk: pick("hoursPlayed2Wk"),
+      steam_rating: pick("steamRating"),
+      trade_ban_state: pick("tradeBanState"),
+      vac_banned: pick("vacBanned"),
+      most_played_games: (() => {
+        const games = [];
+        const re = /<mostPlayedGame>[\s\S]*?<gameName>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/gameName>[\s\S]*?<hoursPlayed>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/hoursPlayed>[\s\S]*?<\/mostPlayedGame>/g;
+        let m;
+        while ((m = re.exec(text)) !== null) {
+          games.push({ name: m[1].trim(), hours: m[2].trim() });
+        }
+        return games;
+      })(),
+    };
+  } catch { return null; }
+}
 
 // ---------- trust heuristic ----------
-function trustHeuristic({ summary, bans, games, level, friends }) {
+function trustHeuristic({ summary, bans, games, level, friends, gameStats, achievements }) {
   let score = 50;
   const notes = [];
 
@@ -185,15 +219,13 @@ function trustHeuristic({ summary, bans, games, level, friends }) {
   if (bans.EconomyBan && bans.EconomyBan !== "none") { score -= 30; notes.push(`economy ban: ${bans.EconomyBan}`); }
   if (cleanBans) { score += 10; notes.push("банов нет"); }
 
-  const ageYears = summary.timecreated
-    ? (Date.now() / 1000 - summary.timecreated) / (365.25 * 86400)
-    : 0;
+  const ageYears = summary.timecreated ? (Date.now() / 1000 - summary.timecreated) / (365.25 * 86400) : 0;
   if (ageYears >= 10) { score += 20; notes.push(`аккаунту ${ageYears.toFixed(1)} лет`); }
   else if (ageYears >= 5) { score += 12; notes.push(`аккаунту ${ageYears.toFixed(1)} лет`); }
   else if (ageYears >= 2) { score += 5; notes.push(`аккаунту ${ageYears.toFixed(1)} лет`); }
   else if (ageYears > 0 && ageYears < 0.5) { score -= 10; notes.push("аккаунт свежий (< 6 мес)"); }
 
-  const cs = games.find(g => g.appid === 730);
+  const cs = games.find(g => g.appid === CS2_APPID);
   if (cs) {
     const h = Math.round(cs.playtime_forever / 60);
     if (h >= 2000) { score += 15; notes.push(`CS2: ${h} ч`); }
@@ -212,15 +244,30 @@ function trustHeuristic({ summary, bans, games, level, friends }) {
   }
 
   if (friends != null) {
-    if (friends >= 100) { score += 5; notes.push(`друзей: ${friends}`); }
-    else if (friends < 5) { score -= 5; notes.push(`друзей: ${friends} — мало`); }
-    else notes.push(`друзей: ${friends}`);
+    const n = friends.length;
+    if (n >= 100) { score += 5; notes.push(`друзей: ${n}`); }
+    else if (n < 5) { score -= 5; notes.push(`друзей: ${n} — мало`); }
+    else notes.push(`друзей: ${n}`);
   } else {
     notes.push("список друзей скрыт");
   }
 
   if (summary.communityvisibilitystate === 3) { score += 5; notes.push("профиль публичный"); }
   else { score -= 5; notes.push("профиль частично закрыт"); }
+
+  if (gameStats) {
+    const kills = gameStats.find(s => s.name === "total_kills")?.value;
+    const deaths = gameStats.find(s => s.name === "total_deaths")?.value;
+    if (kills && deaths) {
+      const kd = (kills / deaths).toFixed(2);
+      notes.push(`CS2 K/D: ${kd} (${kills}/${deaths})`);
+    }
+  }
+
+  if (achievements) {
+    const unlocked = achievements.filter(a => a.achieved === 1).length;
+    notes.push(`достижений CS2: ${unlocked}/${achievements.length}`);
+  }
 
   score = Math.max(0, Math.min(100, score));
   const band = score >= 70 ? "высокий" : score >= 45 ? "средний" : "низкий";
@@ -237,8 +284,7 @@ app.use((req, res, next) => {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
-    "Content-Security-Policy":
-      "default-src 'self'; img-src 'self' https://avatars.steamstatic.com https://avatars.cloudflare.steamstatic.com https://community.cloudflare.steamstatic.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'",
+    "Content-Security-Policy": "default-src 'self'; img-src 'self' https://avatars.steamstatic.com https://avatars.cloudflare.steamstatic.com https://community.cloudflare.steamstatic.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'",
   });
   next();
 });
@@ -272,33 +318,98 @@ app.get("/api/profile", rateLimit, async (req, res) => {
       id = await resolveVanity(parsed.value);
     }
 
-    const [summary, bans, games, level, friends] = await Promise.all([
+    // Загружаем ВСЁ параллельно
+    const [summary, bans, games, level, friends, gameStats, achievements, recentGames, xmlProfile] = await Promise.all([
       getSummary(id),
       getBans(id),
       getOwnedGames(id),
       getSteamLevel(id),
       getFriends(id),
+      getGameStats(id, CS2_APPID),
+      getAchievements(id, CS2_APPID),
+      getRecentGames(id),
+      getXmlProfile(id),
     ]);
 
     const ageYears = summary.timecreated
       ? +((Date.now() / 1000 - summary.timecreated) / (365.25 * 86400)).toFixed(1)
       : null;
 
-    const cs = games.find(g => g.appid === 730) || null;
-    const trust = trustHeuristic({ summary, bans, games, level, friends });
+    const cs = games.find(g => g.appid === CS2_APPID) || null;
+    const trust = trustHeuristic({ summary, bans, games, level, friends, gameStats, achievements });
+
+    // Парсим статистику CS2 в удобный вид
+    let cs2Stats = null;
+    if (gameStats) {
+      const get = (name) => gameStats.find(s => s.name === name)?.value ?? null;
+      const kills = get("total_kills");
+      const deaths = get("total_deaths");
+      const headshots = get("total_kills_headshot");
+      const shotsHit = get("total_shots_hit");
+      const shotsFired = get("total_shots_fired");
+      cs2Stats = {
+        kills,
+        deaths,
+        kd: kills && deaths ? +(kills / deaths).toFixed(2) : null,
+        headshots,
+        headshot_pct: kills && headshots ? +((headshots / kills) * 100).toFixed(1) : null,
+        accuracy: shotsFired && shotsHit ? +((shotsHit / shotsFired) * 100).toFixed(1) : null,
+        wins: get("total_wins"),
+        matches_played: get("total_matches_played"),
+        matches_won: get("total_matches_won"),
+        mvps: get("total_mvps"),
+        bombs_planted: get("total_planted_bombs"),
+        hostages_rescued: get("total_rescued_hostages"),
+      };
+    }
+
+    // Достижения CS2
+    let cs2Achievements = null;
+    if (achievements) {
+      const unlocked = achievements.filter(a => a.achieved === 1);
+      cs2Achievements = {
+        total: achievements.length,
+        unlocked: unlocked.length,
+        pct: achievements.length ? +((unlocked.length / achievements.length) * 100).toFixed(1) : 0,
+        list: unlocked.map(a => ({ api: a.apiname, name: a.name || a.apiname })),
+      };
+    }
+
+    // Недавние игры
+    const recent = recentGames.map(g => ({
+      appid: g.appid,
+      name: g.name,
+      hours_2wk: Math.round((g.playtime_2weeks || 0) / 60),
+      hours_total: Math.round(g.playtime_forever / 60),
+    }));
+
+    // Топ игр из XML (если есть)
+    const topGames = xmlProfile?.most_played_games || [];
 
     const payload = {
       steamid: id,
       persona: summary.personaname,
+      real_name: summary.realname || null,
       avatar: summary.avatarfull,
+      avatar_medium: summary.avatarmedium,
+      avatar_small: summary.avatar,
       profile_url: summary.profileurl,
       country: summary.loccountrycode || null,
+      state: summary.locstatecode || null,
+      city_id: summary.loccityid || null,
       created: summary.timecreated || null,
       age_years: ageYears,
       visibility: summary.communityvisibilitystate,
+      profile_state: summary.profilestate,
+      persona_state: summary.personastate,
+      comment_permission: summary.commentpermission,
+      last_logoff: summary.lastlogoff || null,
+      primary_clan_id: summary.primaryclanid || null,
       in_game: summary.gameextrainfo || null,
+      game_id: summary.gameid || null,
+      game_server_ip: summary.gameserverip || null,
       level,
-      friends,
+      friends: friends ? friends.length : null,
       bans,
       games: {
         total: games.length,
@@ -307,12 +418,22 @@ app.get("/api/profile", rateLimit, async (req, res) => {
           hours_2wk: Math.round((cs.playtime_2weeks || 0) / 60),
           last_played: cs.rtime_last_played || null,
         } : null,
+        recent,
+        top: topGames,
       },
+      cs2_stats: cs2Stats,
+      cs2_achievements: cs2Achievements,
+      xml: xmlProfile ? {
+        headline: xmlProfile.headline,
+        summary: xmlProfile.summary,
+        hours_played_2wk: xmlProfile.hours_played_2wk,
+        steam_rating: xmlProfile.steam_rating,
+        trade_ban_state: xmlProfile.trade_ban_state,
+      } : null,
       trust,
       _input: { raw, resolved: { type: parsed.type, value: parsed.value } },
     };
 
-    // кладём в кэш и под уже разрешённым id, чтобы повторные запросы по id тоже попадали
     cacheSet(cacheKey, payload);
     cacheSet(`p:id:${id.toLowerCase()}`, payload);
 
