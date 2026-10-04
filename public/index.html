@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Steam Profile Checker</title>
+<style>
+  :root {
+    --bg:#1b2838; --panel:#16202d; --panel2:#0e1620; --border:#2a475e;
+    --text:#c7d5e0; --muted:#6a8ba7; --accent:#66c0f4; --white:#fff;
+    --ok:#5cb85c; --warn:#f0ad4e; --bad:#d9534f;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); margin:0; padding:32px 16px; }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  h1 { color:var(--accent); margin: 0 0 16px; font-size:24px; }
+  .row { display:flex; gap:8px; margin-bottom:24px; }
+  input {
+    flex:1; padding:12px 14px; border-radius:4px; border:1px solid var(--border);
+    background:var(--panel); color:var(--text); font-size:15px; outline:none;
+  }
+  input:focus { border-color:var(--accent); }
+  button {
+    padding:12px 22px; border:0; border-radius:4px; background:var(--accent);
+    color:#16202d; font-weight:600; cursor:pointer; font-size:15px;
+    transition: background .15s;
+  }
+  button:hover:not(:disabled) { background:#8fd2ff; }
+  button:disabled { opacity:.6; cursor:not-allowed; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:20px; margin-bottom:16px; }
+  .head { display:flex; gap:16px; align-items:center; margin-bottom:16px; flex-wrap:wrap; }
+  .head img { width:96px; height:96px; border-radius:4px; border:2px solid var(--border); }
+  .name { font-size:22px; color:var(--white); font-weight:600; }
+  .sid { font-size:12px; color:var(--muted); word-break:break-all; }
+  .sid a { color:var(--accent); text-decoration:none; }
+  .sid a:hover { text-decoration:underline; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(180px,1fr)); gap:12px; }
+  .cell { background:var(--panel2); padding:12px; border-radius:4px; border:1px solid #24384a; }
+  .cell .k { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; }
+  .cell .v { font-size:18px; color:var(--white); margin-top:4px; word-break:break-word; }
+  .section-title { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; margin-bottom:8px; }
+  .trust-bar { height:10px; background:var(--panel2); border-radius:5px; overflow:hidden; margin-top:8px; }
+  .trust-fill { height:100%; transition: width .4s; }
+  .low { background:var(--bad); } .mid { background:var(--warn); } .high { background:var(--ok); }
+  .notes { list-style:none; padding:0; margin:12px 0 0; font-size:13px; color:#8fabc4; }
+  .notes li { padding:4px 0; border-top:1px solid #24384a; }
+  .ban { color:var(--bad); font-weight:600; } .ok { color:var(--ok); }
+  .err { color:var(--bad); padding:14px; }
+  .muted { color:var(--muted); font-size:13px; }
+  .badge { display:inline-block; font-size:11px; padding:2px 8px; border-radius:10px; background:#24384a; color:#8fabc4; margin-left:8px; }
+  .skeleton { height:20px; background:linear-gradient(90deg,#1e2c3c 25%,#24384a 50%,#1e2c3c 75%); background-size:200% 100%; animation:sh 1.4s infinite; border-radius:3px; }
+  @keyframes sh { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Steam Profile Checker</h1>
+  <div class="row">
+    <input id="q" placeholder="SteamID64 или vanity (например gaben)" autocomplete="off" spellcheck="false">
+    <button id="go">Проверить</button>
+  </div>
+  <div id="out"></div>
+</div>
+
+<script>
+const out = document.getElementById("out");
+const q = document.getElementById("q");
+const go = document.getElementById("go");
+
+go.addEventListener("click", check);
+q.addEventListener("keydown", e => { if (e.key === "Enter") check(); });
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c =>
+    ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+}
+function fmtDate(ts) {
+  if (!ts) return "—";
+  return new Date(ts * 1000).toLocaleDateString("ru-RU");
+}
+
+function skeleton() {
+  out.innerHTML = `
+    <div class="card">
+      <div class="skeleton" style="width:200px;height:24px"></div>
+      <div style="margin-top:12px" class="skeleton"></div>
+      <div style="margin-top:8px" class="skeleton"></div>
+    </div>`;
+}
+
+async function check() {
+  const id = q.value.trim();
+  if (!id) return;
+  go.disabled = true;
+  skeleton();
+  try {
+    const r = await fetch("/api/profile?id=" + encodeURIComponent(id));
+    const d = await r.json();
+    if (!r.ok || d.error) throw new Error(d.error || ("HTTP " + r.status));
+    render(d);
+  } catch (e) {
+    out.innerHTML = `<div class="card err">Ошибка: ${esc(e.message)}</div>`;
+  } finally {
+    go.disabled = false;
+  }
+}
+
+function render(d) {
+  const t = d.trust;
+  const cls = t.band === "высокий" ? "high" : t.band === "средний" ? "mid" : "low";
+  const cs = d.games.cs2;
+  const cached = d._cached ? '<span class="badge">из кэша</span>' : "";
+
+  out.innerHTML = `
+    <div class="card">
+      <div class="head">
+        <img src="${esc(d.avatar)}" alt="">
+        <div>
+          <div class="name">${esc(d.persona)}${cached}</div>
+          <div class="sid">${esc(d.steamid)}${d.country ? " · " + esc(d.country) : ""}</div>
+          <div class="sid"><a href="${esc(d.profile_url)}" target="_blank" rel="noopener noreferrer">${esc(d.profile_url)}</a></div>
+        </div>
+      </div>
+      <div class="grid">
+        <div class="cell"><div class="k">Возраст аккаунта</div><div class="v">${d.age_years ?? "—"} лет</div></div>
+        <div class="cell"><div class="k">Создан</div><div class="v">${fmtDate(d.created)}</div></div>
+        <div class="cell"><div class="k">Игр в библиотеке</div><div class="v">${d.games.total}</div></div>
+        <div class="cell"><div class="k">Steam level</div><div class="v">${d.level ?? "—"}</div></div>
+        <div class="cell"><div class="k">Друзья</div><div class="v">${d.friends ?? "скрыто"}</div></div>
+        <div class="cell"><div class="k">В игре</div><div class="v">${esc(d.in_game || "—")}</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">Баны</div>
+      <div class="grid">
+        <div class="cell"><div class="k">VAC</div><div class="v ${d.bans.VACBanned ? "ban":"ok"}">${d.bans.VACBanned ? "ДА (" + (d.bans.NumberOfVACBans || 1) + ")" : "нет"}</div></div>
+        <div class="cell"><div class="k">Game bans</div><div class="v ${d.bans.NumberOfGameBans > 0 ? "ban":"ok"}">${d.bans.NumberOfGameBans || 0}</div></div>
+        <div class="cell"><div class="k">Community</div><div class="v ${d.bans.CommunityBanned ? "ban":"ok"}">${d.bans.CommunityBanned ? "ДА" : "нет"}</div></div>
+        <div class="cell"><div class="k">Economy</div><div class="v ${d.bans.EconomyBan && d.bans.EconomyBan !== "none" ? "ban":"ok"}">${esc(d.bans.EconomyBan || "none")}</div></div>
+        <div class="cell"><div class="k">Дней с бана</div><div class="v">${d.bans.DaysSinceLastBan || 0}</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">CS2</div>
+      <div class="grid">
+        <div class="cell"><div class="k">Часов всего</div><div class="v">${cs ? cs.hours : "—"}</div></div>
+        <div class="cell"><div class="k">За 2 недели</div><div class="v">${cs ? cs.hours_2wk : "—"}</div></div>
+        <div class="cell"><div class="k">Последний запуск</div><div class="v">${cs ? fmtDate(cs.last_played) : "—"}</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">Trust (эвристика, не Valve)</div>
+      <div style="display:flex;align-items:baseline;gap:12px;margin-top:4px">
+        <div style="font-size:36px;color:var(--white);font-weight:600">${t.score}</div>
+        <div class="muted">/ 100 · ${esc(t.band)}</div>
+      </div>
+      <div class="trust-bar"><div class="trust-fill ${cls}" style="width:${t.score}%"></div></div>
+      <ul class="notes">${t.notes.map(n => "<li>" + esc(n) + "</li>").join("")}</ul>
+    </div>
+  `;
+}
+</script>
+</body>
+</html>
