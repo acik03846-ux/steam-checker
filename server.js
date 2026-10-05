@@ -186,7 +186,7 @@ async function getXmlProfile(id) {
 
 // ---------- Leetify API ----------
 async function getLeetifyProfile(steamId) {
-  if (!LEETIFY_KEY) return null; // без ключа не дёргаем, чтобы не ловить 429
+  if (!LEETIFY_KEY) return null;
   try {
     const headers = { "Authorization": `Bearer ${LEETIFY_KEY}` };
     const d = await fetchJson(`${LEETIFY}/v3/profile?steam64_id=${steamId}`, { headers });
@@ -233,55 +233,137 @@ async function getLeetifyProfile(steamId) {
   }
 }
 
-// ---------- trust heuristic ----------
-function trustHeuristic({ summary, bans, games, level, friends, gameStats, achievements }) {
-  let score = 50;
-  const notes = [];
+// ---------- CS2Tracker (парсинг) ----------
+async function getCS2TrackerData(steamId) {
+  try {
+    const html = await fetchText(`https://cs2tracker.gg/stats/${steamId}`);
+    // Простой парсинг: ищем признаки риска в HTML
+    // Это очень хрупкий парсинг, зависит от вёрстки сайта!
+    const riskMatch = html.match(/risk[^>]*>([^<]*)</i) || html.match(/Risk Score[^>]*>([^<]*)</i);
+    const riskScore = riskMatch ? riskMatch[1].trim() : null;
+    return {
+      risk_score: riskScore,
+      raw_excerpt: html.slice(0, 500) // для отладки
+    };
+  } catch (e) {
+    console.warn("[cs2tracker] error:", e.message);
+    return null;
+  }
+}
+
+// ---------- ГИБРИДНЫЙ РЕЙТИНГ ----------
+function hybridRating({ summary, bans, games, level, friends, gameStats, achievements, leetify, cs2tracker }) {
+  let steamScore = 50;
+  const steamNotes = [];
+
+  // --- 1. Steam-оценка (базовая) ---
   const cleanBans = !bans.VACBanned && !bans.CommunityBanned && !bans.NumberOfGameBans;
-  if (bans.VACBanned) { score -= 40; notes.push(`VAC ban (${bans.NumberOfVACBans || 1})`); }
-  if (bans.NumberOfGameBans > 0) { score -= 25; notes.push(`game ban: ${bans.NumberOfGameBans}`); }
-  if (bans.CommunityBanned) { score -= 20; notes.push("community ban"); }
-  if (bans.EconomyBan && bans.EconomyBan !== "none") { score -= 30; notes.push(`economy ban: ${bans.EconomyBan}`); }
-  if (cleanBans) { score += 10; notes.push("банов нет"); }
+  if (bans.VACBanned) { steamScore -= 40; steamNotes.push(`VAC ban (${bans.NumberOfVACBans || 1})`); }
+  if (bans.NumberOfGameBans > 0) { steamScore -= 25; steamNotes.push(`game ban: ${bans.NumberOfGameBans}`); }
+  if (bans.CommunityBanned) { steamScore -= 20; steamNotes.push("community ban"); }
+  if (bans.EconomyBan && bans.EconomyBan !== "none") { steamScore -= 30; steamNotes.push(`economy ban: ${bans.EconomyBan}`); }
+  if (cleanBans) { steamScore += 10; steamNotes.push("банов нет"); }
+
   const ageYears = summary.timecreated ? (Date.now() / 1000 - summary.timecreated) / (365.25 * 86400) : 0;
-  if (ageYears >= 10) { score += 20; notes.push(`аккаунту ${ageYears.toFixed(1)} лет`); }
-  else if (ageYears >= 5) { score += 12; notes.push(`аккаунту ${ageYears.toFixed(1)} лет`); }
-  else if (ageYears >= 2) { score += 5; notes.push(`аккаунту ${ageYears.toFixed(1)} лет`); }
-  else if (ageYears > 0 && ageYears < 0.5) { score -= 10; notes.push("аккаунт свежий (< 6 мес)"); }
+  if (ageYears >= 10) { steamScore += 20; steamNotes.push(`аккаунту ${ageYears.toFixed(1)} лет`); }
+  else if (ageYears >= 5) { steamScore += 12; steamNotes.push(`аккаунту ${ageYears.toFixed(1)} лет`); }
+  else if (ageYears >= 2) { steamScore += 5; steamNotes.push(`аккаунту ${ageYears.toFixed(1)} лет`); }
+  else if (ageYears > 0 && ageYears < 0.5) { steamScore -= 10; steamNotes.push("аккаунт свежий (< 6 мес)"); }
+
   const cs = games.find(g => g.appid === CS2_APPID);
   if (cs) {
     const h = Math.round(cs.playtime_forever / 60);
-    if (h >= 2000) { score += 15; notes.push(`CS2: ${h} ч`); }
-    else if (h >= 500) { score += 8; notes.push(`CS2: ${h} ч`); }
-    else if (h >= 100) { notes.push(`CS2: ${h} ч`); }
-    else if (h < 20) { score -= 8; notes.push(`CS2: ${h} ч — мало`); }
-  } else notes.push("CS2 не в библиотеке");
+    if (h >= 2000) { steamScore += 15; steamNotes.push(`CS2: ${h} ч`); }
+    else if (h >= 500) { steamScore += 8; steamNotes.push(`CS2: ${h} ч`); }
+    else if (h >= 100) { steamNotes.push(`CS2: ${h} ч`); }
+    else if (h < 20) { steamScore -= 8; steamNotes.push(`CS2: ${h} ч — мало`); }
+  } else steamNotes.push("CS2 не в библиотеке");
+
   if (level != null) {
-    if (level >= 50) score += 8;
-    else if (level >= 20) score += 4;
-    else if (level < 5) score -= 4;
-    notes.push(`Steam level: ${level}`);
+    if (level >= 50) steamScore += 8;
+    else if (level >= 20) steamScore += 4;
+    else if (level < 5) steamScore -= 4;
+    steamNotes.push(`Steam level: ${level}`);
   }
+
   if (friends != null) {
     const n = friends.length;
-    if (n >= 100) { score += 5; notes.push(`друзей: ${n}`); }
-    else if (n < 5) { score -= 5; notes.push(`друзей: ${n} — мало`); }
-    else notes.push(`друзей: ${n}`);
-  } else notes.push("список друзей скрыт");
-  if (summary.communityvisibilitystate === 3) { score += 5; notes.push("профиль публичный"); }
-  else { score -= 5; notes.push("профиль частично закрыт"); }
-  if (gameStats) {
-    const kills = gameStats.find(s => s.name === "total_kills")?.value;
-    const deaths = gameStats.find(s => s.name === "total_deaths")?.value;
-    if (kills && deaths) notes.push(`CS2 K/D: ${(kills/deaths).toFixed(2)} (${kills}/${deaths})`);
+    if (n >= 100) { steamScore += 5; steamNotes.push(`друзей: ${n}`); }
+    else if (n < 5) { steamScore -= 5; steamNotes.push(`друзей: ${n} — мало`); }
+    else steamNotes.push(`друзей: ${n}`);
+  } else steamNotes.push("список друзей скрыт");
+
+  if (summary.communityvisibilitystate === 3) { steamScore += 5; steamNotes.push("профиль публичный"); }
+  else { steamScore -= 5; steamNotes.push("профиль частично закрыт"); }
+
+  steamScore = Math.max(0, Math.min(100, steamScore));
+
+  // --- 2. Leetify-оценка ---
+  let leetifyScore = null;
+  const leetifyNotes = [];
+  if (leetify && leetify.rating) {
+    const r = leetify.rating;
+    const values = [r.aim, r.utility, r.positioning, r.clutch, r.opening].filter(v => v != null);
+    if (values.length > 0) {
+      const avg = values.reduce((a, b) => a + b, 0) / values.length;
+      leetifyScore = Math.round(avg); // Leetify rating обычно 0-100
+      leetifyNotes.push(`Leetify rating: ${leetifyScore} (aim ${r.aim || "—"}, util ${r.utility || "—"}, pos ${r.positioning || "—"})`);
+    }
   }
-  if (achievements) {
-    const unlocked = achievements.filter(a => a.achieved === 1).length;
-    notes.push(`достижений CS2: ${unlocked}/${achievements.length}`);
+
+  // --- 3. CS2Tracker-оценка ---
+  let trackerScore = null;
+  const trackerNotes = [];
+  if (cs2tracker && cs2tracker.risk_score) {
+    // Пытаемся преобразовать risk_score в число 0-100
+    const risk = parseFloat(cs2tracker.risk_score);
+    if (!isNaN(risk)) {
+      // Если risk — это 0-1, преобразуем в 0-100
+      trackerScore = risk <= 1 ? Math.round(risk * 100) : Math.round(risk);
+      // Чем выше риск, тем ниже оценка. Инвертируем.
+      trackerScore = 100 - trackerScore;
+      trackerNotes.push(`CS2Tracker risk: ${cs2tracker.risk_score} → оценка ${trackerScore}`);
+    }
   }
-  score = Math.max(0, Math.min(100, score));
-  const band = score >= 70 ? "высокий" : score >= 45 ? "средний" : "низкий";
-  return { score, band, notes };
+
+  // --- 4. Итоговый гибридный рейтинг ---
+  // Веса: Steam 30%, Leetify 50%, CS2Tracker 20%
+  // Если какой-то источник недоступен, перераспределяем веса
+  let totalWeight = 0;
+  let weightedSum = 0;
+
+  if (steamScore != null) {
+    weightedSum += steamScore * 0.3;
+    totalWeight += 0.3;
+  }
+  if (leetifyScore != null) {
+    weightedSum += leetifyScore * 0.5;
+    totalWeight += 0.5;
+  }
+  if (trackerScore != null) {
+    weightedSum += trackerScore * 0.2;
+    totalWeight += 0.2;
+  }
+
+  let finalScore = totalWeight > 0 ? Math.round(weightedSum / totalWeight) : 50;
+  finalScore = Math.max(0, Math.min(100, finalScore));
+
+  const band = finalScore >= 70 ? "высокий" : finalScore >= 45 ? "средний" : "низкий";
+
+  return {
+    score: finalScore,
+    band,
+    components: {
+      steam: { score: steamScore, notes: steamNotes },
+      leetify: leetifyScore != null ? { score: leetifyScore, notes: leetifyNotes } : null,
+      cs2tracker: trackerScore != null ? { score: trackerScore, notes: trackerNotes } : null,
+    },
+    notes: [
+      ...steamNotes,
+      ...leetifyNotes,
+      ...trackerNotes,
+    ],
+  };
 }
 
 // ---------- app ----------
@@ -320,7 +402,7 @@ app.get("/api/profile", rateLimit, async (req, res) => {
     if (parsed.type === "id") id = parsed.value;
     else id = await resolveVanity(parsed.value);
 
-    const [summary, bans, games, level, friends, gameStats, achievements, recentGames, xmlProfile, leetify] = await Promise.all([
+    const [summary, bans, games, level, friends, gameStats, achievements, recentGames, xmlProfile, leetify, cs2tracker] = await Promise.all([
       getSummary(id),
       getBans(id),
       getOwnedGames(id),
@@ -331,13 +413,14 @@ app.get("/api/profile", rateLimit, async (req, res) => {
       getRecentGames(id),
       getXmlProfile(id),
       getLeetifyProfile(id),
+      getCS2TrackerData(id),
     ]);
 
     const ageYears = summary.timecreated
       ? +((Date.now() / 1000 - summary.timecreated) / (365.25 * 86400)).toFixed(1)
       : null;
     const cs = games.find(g => g.appid === CS2_APPID) || null;
-    const trust = trustHeuristic({ summary, bans, games, level, friends, gameStats, achievements });
+    const trust = hybridRating({ summary, bans, games, level, friends, gameStats, achievements, leetify, cs2tracker });
 
     let cs2Stats = null;
     if (gameStats) {
@@ -407,6 +490,7 @@ app.get("/api/profile", rateLimit, async (req, res) => {
         trade_ban_state: xmlProfile.trade_ban_state,
       } : null,
       leetify: leetify || null,
+      cs2tracker: cs2tracker || null,
       trust,
       _input: { raw, resolved: { type: parsed.type, value: parsed.value } },
     };
